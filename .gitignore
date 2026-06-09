@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# IdC SAML metadata is per-deployment, not a secret but tied to one IdC instance
+# Comment this out if you want to share metadata with collaborators
+idc-saml-metadata.xml
+
+# Backups
+*.bak
+*~
+
+# OS
+.DS_Store
+Thumbs.db
