@@ -1,146 +1,142 @@
-# Step 4b — AD-backed 场景：建 AD 用户/组 + 重订阅 Quick 为 AD identity
+# Scenario 2 — Active Directory and Amazon Quick Setup
 
-> **本文档只适用于场景 2（`SCENARIO=ad`）**。
-> 场景 1（IdC backed）请用 `04a-identity-center-setup.md`。
+> Applies to **Scenario 2 (`SCENARIO=ad`) only**. For Scenario 1 see [`04a-identity-center-setup.md`](04a-identity-center-setup.md).
 >
-> 本步骤会**取消现有 Quick 订阅**，所以如果 Quick 上有重要数据先备份。
+> ⚠️ **This step unsubscribes the existing Amazon Quick account.** Back up anything you cannot afford to lose first; the test account in this guide assumes a clean slate.
 
-## 0. 前置条件
+This document creates AD groups and a test user via the Directory Service Data API, then unsubscribes Quick and re-subscribes it with **Active Directory** as the identity type so AD groups become Quick role bindings.
 
-- `01-managed-ad.yaml` / `02-keycloak-infra.yaml` / `02b-cloudfront.yaml` 三个 stack 已部署
-- `.env` 里 `AD_DIRECTORY_ID` / `AD_DNS_IP_1` / `AD_DNS_IP_2` 已被 `deploy-infra.sh` 自动回填
-- AWS CLI 默认凭据是该账号的管理员
+## 0. Prerequisites
 
-## 1. 启用 Directory Service Data API
+- All three CloudFormation stacks deployed (`./deploy-infra.sh` completed).
+- `.env` already contains `AD_DIRECTORY_ID`, `AD_DNS_IP_1`, and `AD_DNS_IP_2` (auto-populated by `deploy-infra.sh`).
+- AWS CLI default credentials are administrator-level on this account.
 
-ds-data API 是 Managed AD 的现代用户/组管理通道（不需要域加入 Windows EC2）。
-默认是关的，先启用：
+## 1. Enable the Directory Service Data API
+
+The Data API is the modern user/group management interface for Managed AD — no domain-joined Windows EC2 required. It is disabled by default; enable it once:
 
 ```bash
 source .env
 aws ds enable-directory-data-access \
   --directory-id "$AD_DIRECTORY_ID" --region "$AWS_REGION"
 
-# 等几秒确认状态
+# Wait a few seconds for the state to flip
 sleep 5
 aws ds describe-directory-data-access \
   --directory-id "$AD_DIRECTORY_ID" --region "$AWS_REGION"
-# 期望: DataAccessStatus = Enabled
+# Expected: DataAccessStatus = Enabled
 ```
 
-## 2. 填好测试用户的 email + 强密码
+## 2. Choose a test user email and password
 
-编辑 `.env`：
+Edit `.env`:
 
 ```ini
 AD_TEST_USER_SAM=quicktest1
-AD_TEST_USER_EMAIL=<你的真实邮箱，例如 you+quicktest1@yourmail.com>
-AD_TEST_USER_PASSWORD=<生成一个强密码>
+AD_TEST_USER_EMAIL=<a real, deliverable email address>
+AD_TEST_USER_PASSWORD=<strong password>
 ```
 
-> **email 必须能实际收信** —— Quick 订阅时可能往这个邮箱发邀请；并且 Quick Desktop
-> 用 id_token.email 匹配用户，必须和 Quick 内显示的 email 完全一致。
->
-> 密码要满足 AD 默认复杂度（≥8 字符，含大小写 + 数字 + 符号）。生成参考：
->
-> ```bash
-> python3 -c "import secrets,string; chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#%^*-_=+'; print(''.join(secrets.choice(chars) for _ in range(18)))"
-> ```
+The email **must be a real address** because Amazon Quick may send invitations / notifications to it, and Quick Desktop matches users by `id_token.email`. If you use a plus-address such as `you+quicktest1@example.com`, make sure your provider routes it correctly.
 
-## 3. 一键建 3 个 group + 1 个测试用户
+The password must satisfy AD's default complexity policy (≥ 8 characters, with at least three of the four categories: upper, lower, digit, symbol). A reasonable generator:
+
+```bash
+python3 - <<'PY'
+import secrets
+chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#%^*-_=+'
+while True:
+    pw = ''.join(secrets.choice(chars) for _ in range(18))
+    if any(c.isupper() for c in pw) and any(c.islower() for c in pw) \
+       and any(c.isdigit() for c in pw) and any(not c.isalnum() for c in pw):
+        print(pw); break
+PY
+```
+
+## 3. Create three groups + one test user
 
 ```bash
 ./ad-setup-quick.sh
 ```
 
-脚本幂等，运行后：
+The script is idempotent. After it completes:
 
-- 3 个 AD group 在 `OU=Users,OU=<SHORT_NAME>`：
-  - `quickadmins`（之后绑成 Quick Admin）
-  - `quickauthors`（之后绑成 Quick Author）
-  - `quickreaders`（之后绑成 Quick Reader）
-- 1 个测试用户 `quicktest1`：
-  - mail = `AD_TEST_USER_EMAIL`
-  - GivenName = `Quick`, Surname = `Test1`
-  - 密码 = `AD_TEST_USER_PASSWORD`，已 enabled
-  - 在 group `quickadmins` 里
+- Three security groups in `OU=Users,OU=<AD_SHORT_NAME>`:
+  - `quickadmins` — to be bound to Quick **Admin** role
+  - `quickauthors` — to be bound to Quick **Author** role
+  - `quickreaders` — to be bound to Quick **Reader** role
+- One test user `quicktest1`:
+  - `mail` = `AD_TEST_USER_EMAIL`
+  - `givenName` = `Quick`, `sn` = `Test1`
+  - password set, account enabled
+  - member of `quickadmins`
 
-输出最后会列出所有用户和 group，确认看到 `quicktest1` 和三个 group 即可。
+The script ends by printing the resulting users / groups / membership. Confirm `quicktest1` appears with the expected email and that it is a member of `quickadmins`.
 
-## 4. 取消当前 Quick 订阅
+## 4. Unsubscribe the current Amazon Quick account
 
-> 这一步**会清掉 Quick 上的所有数据**（datasets、dashboards、analyses）。如果有
-> 不想丢的内容先 export。
+> This deletes all datasets, dashboards, and analyses in the current Quick account.
 
-1. 浏览器登 https://quicksuite.aws.amazon.com/
-2. 右上角用户名 → **Manage Quick**
-3. 左侧 **Account settings** → 滚到底 → **Delete account / Unsubscribe**
-4. 输入账号名确认
-5. 等几分钟让 AWS 后端释放资源
+1. Sign in to <https://quicksuite.aws.amazon.com/>.
+2. Top-right user menu → **Manage Quick**.
+3. **Account settings** → scroll to the bottom → **Delete account / Unsubscribe**.
+4. Confirm by typing the account name.
+5. Wait several minutes for AWS to fully release the resources.
 
-## 5. 重新订阅 Quick Enterprise，identity 选 Active Directory
+## 5. Re-subscribe Quick with Active Directory as the identity type
 
-1. https://aws.amazon.com/quick/ → **Sign up for Quick** → **Enterprise edition**
-2. **Authentication method** → **Use Active Directory**
-3. **Directory** 下拉选 `corp.example.com`（你的 Managed AD）
-4. **Account name** 起一个新的（例如 `ad-test`）。同名复用可能要等几小时。
-5. **Region**: us-east-1
-6. **Notification email**: 你的邮箱
-7. **Group bindings**（这一步**只能在订阅时填**，建好账号再加要进控制台单独操作）：
+1. Open <https://aws.amazon.com/quick/> → **Sign up for Quick** → **Enterprise edition**.
+2. **Authentication method** → **Use Active Directory**.
+3. **Directory** → choose `corp.example.com` (your Managed AD).
+4. **Account name** → choose a fresh value (e.g. `ad-test`). Reusing the previous name may require waiting several hours.
+5. **Region** → `us-east-1`.
+6. **Notification email** → your administrator email.
+7. **Group bindings** — these can only be set during signup:
 
    | Quick role | AD group |
-   |---|---|
-   | **Admin Pro** (Enterprise) | `quickadmins` |
-   | Admin (legacy) | （留空） |
+   |------------|----------|
+   | Admin Pro (Enterprise) | `quickadmins` |
+   | Admin (legacy) | (leave empty) |
    | Author Pro (Enterprise) | `quickauthors` |
-   | Author (legacy) | （留空） |
+   | Author (legacy) | (leave empty) |
    | Reader Pro (Professional) | `quickreaders` |
-   | Reader (legacy) | （留空） |
+   | Reader (legacy) | (leave empty) |
 
-   > Quick 的 group 选择框是模糊查询：在框里输 `quick` 就会下拉显示三个组。
-   > 如果你输 `AD group` 之类的占位符文字会显示 "No options"。
+   > The Quick group selector is a fuzzy lookup. Type `quick` to surface the three groups; do not leave placeholder text in the field.
 
-8. **Encryption**: 选 AWS-managed key（默认）
-9. 提交订阅
+8. **Encryption** → AWS-managed key (default).
+9. Submit.
 
-订阅成功后回 `.env` 把新账号名写回：
+After the new subscription is provisioned, update `.env`:
 
 ```ini
-QUICK_NAMESPACE=ad-test          # 你刚填的 Account name
+QUICK_NAMESPACE=ad-test                 # the new account name
 QUICK_AUTHENTICATION_TYPE=ACTIVE_DIRECTORY
 ```
 
-## 6. 验证 quicktest1 已经在 Quick 里
+## 6. Confirm the test user lands in Quick
 
-订阅完成后等 2-5 分钟，AD group `quickadmins` 的成员（即 `quicktest1`）会自动进 Quick。
+Within a few minutes, members of `quickadmins` (i.e. `quicktest1`) propagate to Quick automatically.
 
-测一下浏览器登录：
-1. 打开 https://quicksuite.aws.amazon.com/sn/start （或者你 Quick 账号的 access URL）
-2. 输入 username = `quicktest1`，password = `AD_TEST_USER_PASSWORD`
-3. 应该进入 Quick 主界面
+Sanity-check by signing in to the Quick web app directly:
 
-> 这时是 Quick **直连 AD** 的登录路径，没有走 Keycloak。
-> Keycloak OIDC 是给 **Quick Desktop 客户端** 用的，下一步才用到。
+1. Open <https://quicksuite.aws.amazon.com/sn/start> (or your account's access URL).
+2. Username: `quicktest1`. Password: `AD_TEST_USER_PASSWORD`.
+3. The Quick main interface should load.
 
-## 7. 进入下一步
+> This is Quick's direct AD login path — no Keycloak in the loop. Keycloak is exercised in the next phase, when Quick **Desktop** uses OIDC against Keycloak.
 
-- 回到 Step 3 §3 配置 Keycloak 的 OIDC public client（`configure-keycloak.sh` 自动跑，
-  脚本不创建 SAML IdP，只建 OIDC client；同一脚本两个场景都用）
-- 然后 `verify-oidc.sh` → `test-keycloak-ldap-login.sh`
-- 然后 `05-quick-extension-access.md` 把 Keycloak OIDC endpoint 填进 Quick
+## 7. Next step
 
-## 故障排查
+Run `./configure-keycloak.sh` (Phase 4 in the deployment guide), then `./verify-oidc.sh`, then [`05-quick-extension-access.md`](05-quick-extension-access.md).
 
-### 订阅 Quick 时 group dropdown 显示 "No options"
-- 框里别输 placeholder，输 `quick` 触发模糊匹配。
-- 确认 `ad-setup-quick.sh` 跑成功，`aws ds-data list-groups` 能看到三个 group。
+## Troubleshooting
 
-### 用 quicktest1 登 Quick web 报 "Invalid credentials"
-- 密码错了（特殊字符可能在 web form 不支持，回 .env 检查）
-- 用户被 disabled。`aws ds-data describe-user --directory-id ... --sam-account-name quicktest1`
-  应该看到 `Enabled: true`
-- AD 那边密码 lockout。等 30 分钟或者重新跑 `ad-setup-quick.sh` reset 密码
-
-### 订阅后 Quick 控制台看不到 quicktest1
-- 等 5-10 分钟，AD group sync 不是即时的
-- 或者在 Quick 控制台 Manage users → Add user 手动加（按 sAMAccountName 填）
+| Symptom | Resolution |
+|---------|------------|
+| `aws ds-data list-users` returns `AccessDeniedException: DS Data feature is not enabled` | Run `aws ds enable-directory-data-access` (§1) and retry. |
+| Quick group dropdown shows "No options" | Type `quick` to trigger fuzzy lookup; do not enter placeholder text. Confirm the groups exist with `aws ds-data list-groups`. |
+| `quicktest1` cannot sign in to Quick web | Wrong password (check special-character handling); user disabled (verify with `aws ds-data describe-user`); AD lockout (wait 30 min or re-run `./ad-setup-quick.sh` to reset). |
+| Quick console does not show `quicktest1` | Wait 5–10 minutes for AD ↔ Quick sync, or add the user manually via Manage users. |
+| `ad-setup-quick.sh` produces groups named `12`, `20`, `61`, ... | The script was edited to declare a Bash array named `GROUPS`. `GROUPS` is a Bash built-in read-only array variable; rename to e.g. `QUICK_GROUPS`. |

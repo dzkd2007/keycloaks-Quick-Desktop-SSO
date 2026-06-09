@@ -1,94 +1,65 @@
-# Step 5 — Amazon Quick 控制台：创建 Extension Access
+# Quick Console: Extension Access for Desktop
 
-> 这一步把 Keycloak 的 OIDC endpoints 告诉 Quick，让 Quick Desktop 客户端在用户
-> 点 **Enterprise login** 时知道要去哪里跑 OIDC 流程。**两个场景都用同样的配置**
-> （因为两个场景共享同一个 Keycloak realm + OIDC client）。
->
-> 参考：[Setting up Amazon Quick on desktop for enterprise deployments](https://docs.aws.amazon.com/quick/latest/userguide/desktop-enterprise-setup.html)
+This step exposes the Keycloak OIDC endpoints to Amazon Quick so that Quick Desktop can run the Enterprise login flow. Both scenarios use the same configuration because they share the same Keycloak realm and the same OIDC public client.
 
-## 0. 前置条件
+Reference: [Setting up Amazon Quick on desktop for enterprise deployments](https://docs.aws.amazon.com/quick/latest/userguide/desktop-enterprise-setup.html).
 
-- Step 3 已完成（`configure-keycloak.sh` 跑成功）
-- Step 4a（场景 1）或 Step 4b（场景 2）已完成
-- `./verify-oidc.sh` 看到 `OK — Keycloak side looks good.`
+## 0. Prerequisites
 
-## 1. 在 Quick 管理控制台添加 Extension Access
+- Phase 4 is complete (`configure-keycloak.sh` finished successfully).
+- Phase 3 (`04a-...md` for Scenario 1, or `04b-...md` for Scenario 2) is complete.
+- `./verify-oidc.sh` ends with `OK — Keycloak side looks good.`
 
-1. 浏览器登录 Amazon Quick：
-   - 场景 1：用 IdC 用户登入（IdC SAML application 已 assign 给你这个 user/group）
-   - 场景 2：用 AD 用户名+密码登入（如 `quicktest1`）
-2. 右上角用户名 → **Manage Quick**
-3. 左侧 **Permissions** → **Extension access** → **Add extension access**
-4. 选 **Desktop application for Quick** → **Next**
+## 1. Add an Extension Access entry
 
-### 1.1 填 OIDC 端点
+1. Sign in to Amazon Quick:
+   - Scenario 1 — sign in with an IdC user that is assigned to the IdC SAML application.
+   - Scenario 2 — sign in with an AD username and password (e.g. `quicktest1`).
+2. Top-right user menu → **Manage Quick**.
+3. **Permissions → Extension access → Add extension access**.
+4. Choose **Desktop application for Quick** → **Next**.
 
-| 字段 | 值 |
-|---|---|
+### 1.1 OIDC endpoints
+
+| Field | Value |
+|-------|-------|
 | Issuer URL | `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>` |
 | Authorization endpoint | `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>/protocol/openid-connect/auth` |
 | Token endpoint | `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>/protocol/openid-connect/token` |
 | JWKS URI | `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>/protocol/openid-connect/certs` |
 | Client ID | `<KEYCLOAK_OIDC_CLIENT_ID>` |
 
-替换 `<...>` 为 `.env` 里的实际值，或从 `./verify-oidc.sh` 输出抄。
+Copy the values from `verify-oidc.sh`'s output — the `[1] OIDC discovery` block lists them verbatim.
 
-> ⚠️ Issuer URL **不要带** `/.well-known/openid-configuration` 后缀。
-> Quick 控制台明确说创建后不可编辑，**保存前再核一遍**。
+> ⚠️ Issuer URL must **not** include the `/.well-known/openid-configuration` suffix. The Quick console explicitly states the configuration **cannot be edited** after creation; verify each value before clicking **Add**.
 
-点 **Add**。
+### 1.2 Activate the extension
 
-### 1.2 创建 Extension
+1. **Connect apps and data → Extensions → Add extension**.
+2. Choose the Extension Access you just created → **Next** → **Create**.
+3. The extension status should be **Active**.
 
-1. 左侧 **Connect apps and data** → **Extensions** → **Add extension**
-2. 选刚才创建的 Extension Access → **Next** → **Create**
+## 2. End-to-end test
 
-## 2. 端到端验证
+1. Download Amazon Quick Desktop from <https://aws.amazon.com/quick/download/> (macOS 12+, Windows 10+).
+2. Launch the app and choose **Enterprise login**.
+3. Enter your Quick account name (`QUICK_NAMESPACE`).
+4. A browser window opens the Keycloak login page:
 
-1. 下载 Amazon Quick Desktop：https://aws.amazon.com/quick/download/
-2. 打开应用 → **Enterprise login**
-3. 输入 Quick 账号名（即 `QUICK_NAMESPACE`）
-4. 浏览器跳到 Keycloak 登录页
+   | Scenario | Expected |
+   |----------|----------|
+   | 1 (`idc`) | A **Sign in with AWS IAM Identity Center** button — clicking it redirects to the IdC login page. |
+   | 2 (`ad`) | A standard username + password form — enter the AD username (e.g. `quicktest1`) and password. |
 
-| 场景 | 期望看到 |
-|---|---|
-| **1 (idc)** | 一个 **Sign in with AWS IAM Identity Center** 按钮，点了跳 IdC 登录 |
-| **2 (ad)** | 标准 username + password 表单，输 AD 用户名/密码（如 `quicktest1`） |
+5. After signing in, the browser redirects to `http://localhost:18080?code=…`, the Desktop client exchanges the code for tokens via PKCE, validates the `email` claim, and shows the Quick main interface.
 
-5. 登录成功后浏览器 302 回 `http://localhost:18080?code=...`
-6. Quick Desktop 用 code + PKCE verifier 换 token
-7. Desktop 解 id_token，按 `email` claim 匹配 Quick 账号里的 user → 进入 Quick 主界面
+## 3. Troubleshooting
 
-## 3. 故障排查
-
-### `redirect_mismatch`
-Keycloak `<KEYCLOAK_OIDC_CLIENT_ID>` client 的 Valid redirect URIs 必须**精确**等于
-`http://localhost:18080`。`./verify-oidc.sh` 会显示这个字段。
-
-### `User not found after sign-in`
-登录用的用户的 email 和 Quick 里看到的 email 不一致。
-- 场景 1：检查 IdC user 的 email = Quick user 的 email
-- 场景 2：检查 AD user 的 mail attribute = Quick 里 sync 来的 user email
-  ```bash
-  aws ds-data describe-user --directory-id "$AD_DIRECTORY_ID" \
-    --sam-account-name quicktest1 --region us-east-1 \
-    --query EmailAddress --output text
-  ```
-
-### "Session expires frequently"
-`offline_access` 没在 scope 里。检查 Quick Extension Access 的 scope 字段
-（通常默认就含 `openid email profile offline_access`）。
-
-### Token validation failure
-Issuer URL 不一致。Keycloak issuer 是 `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>`
-（**没有**结尾的斜杠，**没有** `/.well-known/openid-configuration` 后缀）。
-
-### 场景 2：Keycloak 登录页还有 SAML 按钮
-跑 `SCENARIO=ad ./configure-keycloak.sh` 重新禁用，或者手动去 Keycloak Admin
-→ Identity providers → `iam-identity-center` → Settings 把 Enabled 关掉。
-
-### 登录页 502 / 504
-ALB target group 健康检查失败。`aws elbv2 describe-target-health
---target-group-arn $(aws elbv2 describe-target-groups --names keycloak-tg
---query 'TargetGroups[0].TargetGroupArn' --output text) --region us-east-1`。
-首次部署 Keycloak 跑 Liquibase migration 5-10 分钟才会变 healthy。
+| Symptom | Resolution |
+|---------|------------|
+| `redirect_mismatch` | The OIDC client's redirect URI must be exactly `http://localhost:18080` — no trailing slash, no path, no wildcard. `verify-oidc.sh` reports the current value. |
+| "User not found after sign-in" | The signed-in identity's email does not match a Quick user. Inspect both sides: <br>• Scenario 1 — IdC user email vs. Quick user email <br>• Scenario 2 — `aws ds-data describe-user --directory-id "$AD_DIRECTORY_ID" --sam-account-name <user>` and Quick → Manage users |
+| "Session expires frequently" | `offline_access` not in scope. Check that the OIDC client lists `offline_access` under Optional Client Scopes (visible in `verify-oidc.sh`). |
+| Token validation failure | Issuer URL mismatch. Keycloak's issuer is `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>` with no trailing slash and no `.well-known` suffix. |
+| Scenario 2: Keycloak login page still shows the SAML button | Re-run `SCENARIO=ad ./configure-keycloak.sh`, or disable the IdP manually in **Identity providers**. |
+| Login page returns 502 / 504 | The ALB target group health check is failing. On a fresh deploy, Keycloak takes 5–10 minutes to finish Liquibase migrations before the targets become healthy. Inspect `aws elbv2 describe-target-health`. |
