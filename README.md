@@ -1,202 +1,254 @@
-# QuickSuite Desktop SSO
+# QuickSuite Desktop SSO via Keycloak — Two Identity Backends
 
-完整可复用的部署包：把 **Amazon Quick Desktop** 客户端的 SSO 接到企业 IdP。
+[中文版](README.zh.md) | English
 
-提供两种**实测可用**的架构，用同一套 Keycloak / Aurora / ALB / CloudFront 基础设施，
-通过 `SCENARIO` 环境变量切换：
+CloudFormation deployment of a **Keycloak 25** Identity Provider that federates **Amazon Quick Desktop** (OIDC + PKCE) to either **AWS IAM Identity Center** or **AWS Managed Microsoft AD**, depending on a single `SCENARIO` flag.
 
-| 场景 | 架构 | 适用 |
-|---|---|---|
-| **场景 1 (`SCENARIO=idc`)** | Quick is **IAM Identity Center** backed; Keycloak 在中间做 OIDC↔SAML broker | 已经/想要把 IdC 当统一 workforce identity 入口；用户/组都在 IdC 内置 directory |
-| **场景 2 (`SCENARIO=ad`)** | Quick is **Active Directory** backed; Keycloak 通过 LDAP federation 直连 Managed AD | 用户/组以 AD 为权威；想去掉 IdC 这一层 |
+End-to-end tested on `us-east-1` with Quick Enterprise edition.
 
-两种场景都让 Quick Desktop 客户端走 OIDC + PKCE 的 Enterprise login 流程，
-最终匹配 `id_token.email` → Quick 用户登录。
+## Architecture
 
-## 架构图
+Both scenarios share the same Keycloak / Aurora / ALB / CloudFront infrastructure. Only the identity backend differs.
 
-### 共用基础设施（两个场景都跑同一套）
+### Scenario 1 — IAM Identity Center backed (`SCENARIO=idc`)
 
-```
-                              Internet
-                                 │
-                                 ▼
-            ┌────────────────────────────────────────┐
-            │  CloudFront (CachingDisabled+AllViewer)│
-            │  Alias → keycloak.<your-domain>        │
-            └─────────────────┬──────────────────────┘
-                              │ HTTPS, SNI=kc-origin.<your-domain>
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  AWS account · region us-east-1 · existing VPC                      │
-│                                                                     │
-│  ┌──────────────────────────┐                                       │
-│  │  Internet-facing ALB     │  SG ingress: 443 from CloudFront      │
-│  │  + ACM cert              │  origin-facing managed prefix list    │
-│  └─────────────┬────────────┘  (no 0.0.0.0/0 allowed)               │
-│                ▼                                                    │
-│  ┌──────────────────────────┐    ┌─────────────────────┐            │
-│  │  ECS Fargate · Keycloak  │───▶│ Aurora Serverless v2│            │
-│  │  realm: quicksuite       │    │ PostgreSQL          │            │
-│  │  OIDC client:            │    └─────────────────────┘            │
-│  │    amazon-quick-desktop  │                                       │
-│  │    (public + PKCE S256)  │                                       │
-│  └─────────────┬────────────┘                                       │
-│                │                                                    │
-└────────────────┼────────────────────────────────────────────────────┘
-                 │
-        Identity source ↓ depends on SCENARIO
+```mermaid
+flowchart LR
+    QD["Amazon Quick<br/>Desktop"]
+    CF[CloudFront]
+    ALB[ALB]
+    KC["Keycloak 25<br/>realm: quicksuite<br/>broker"]
+    IDC["IAM Identity Center<br/>(SAML IdP)"]
+    QA[("Amazon Quick<br/>account<br/>(IdC backed)")]
+
+    QD -->|"OIDC PKCE<br/>localhost:18080"| CF
+    CF -->|HTTPS| ALB
+    ALB --> KC
+    KC -->|"SAML 2.0<br/>via custom app"| IDC
+    IDC -->|users / groups| QA
 ```
 
-### 场景 1：`SCENARIO=idc`
+### Scenario 2 — Active Directory backed (`SCENARIO=ad`)
 
-```
-                 OIDC PKCE                     SAML 2.0
-Quick Desktop ─────────────→ Keycloak ──────────────────→ IAM Identity Center
-   redirect_uri=                broker                      ╲
-   localhost:18080                                            ╲ users/groups in
-                                                                IdC internal directory
-                                                                (no AD needed)
+```mermaid
+flowchart LR
+    QD["Amazon Quick<br/>Desktop"]
+    CF[CloudFront]
+    ALB[ALB]
+    KC["Keycloak 25<br/>realm: quicksuite<br/>+ LDAP federation"]
+    AD["AWS Managed<br/>Microsoft AD<br/>corp.example.com"]
+    QA[("Amazon Quick<br/>account<br/>(AD backed)")]
 
-Quick account (IdC backed) ──► IdC (identity source) ──► same users
-```
-
-- Keycloak realm 有一个 SAML Identity Provider `iam-identity-center` 指向 IdC
-- IdC 端有一个 Customer Managed SAML 2.0 application 指回 Keycloak ACS URL
-- `id_token.email` 来自 IdC SAML assertion 里的 email attribute
-- AD/LDAP federation **可选**（不部署可省 ~$88/月）
-
-### 场景 2：`SCENARIO=ad`
-
-```
-                  OIDC PKCE              LDAP federation
-Quick Desktop ─────────────→ Keycloak ──────────────────→ AWS Managed Microsoft AD
-   redirect_uri=                                            ╲
-   localhost:18080                                            ╲ users/groups + passwords
-                                                                in AD (corp.example.com)
-
-Quick account (AD backed) ──► AD (identity source) ──► same users via AD groups
+    QD -->|"OIDC PKCE<br/>localhost:18080"| CF
+    CF -->|HTTPS| ALB
+    ALB --> KC
+    KC -->|"LDAP<br/>(389)"| AD
+    AD -->|users via<br/>quickadmins / quickauthors / quickreaders| QA
 ```
 
-- Keycloak realm **没有** SAML IdP，直接用 LDAP federation 做用户密码校验
-- `id_token.email` 来自 AD user 的 `mail` 属性
-- Quick 订阅时把 AD groups（`quickadmins/quickauthors/quickreaders`）绑给 Admin/Author/Reader
+In both cases the Desktop client receives an OIDC `id_token` whose `email` claim matches an existing Quick user, completing the sign-in.
 
-## 成本对比（us-east-1，On-Demand，单 task / Aurora 平均 0.7 ACU / 低 SSO 流量）
+## What Gets Deployed
 
-价格来自 AWS Pricing API，按 730 hr/月 估算。**两个场景共用大部分组件**，差异在
-身份后端是 IdC（免费）还是 Managed AD。
+| Resource | Description |
+|----------|-------------|
+| **AWS Managed Microsoft AD** | Cross-AZ directory in private subnets. Required for `SCENARIO=ad`; optional for `SCENARIO=idc`. |
+| **ECS Fargate (Keycloak 25)** | 2 vCPU / 4 GB task running `quay.io/keycloak/keycloak:25.0`, Infinispan cache, ECS Exec enabled. |
+| **Aurora Serverless v2 PostgreSQL 16** | Multi-AZ, capacity range 0.5 – 4 ACU, encrypted, snapshot on delete. |
+| **Internet-facing ALB** | HTTPS-only, ACM cert, Security Group ingress restricted to the CloudFront origin-facing managed prefix list (no `0.0.0.0/0`). |
+| **CloudFront distribution** | `PriceClass_All`, `CachingDisabled`, `AllViewer` origin policy — required because OIDC tokens / JWKS must not be cached. |
+| **Route 53 alias records** | Public alias to CloudFront + internal alias for the origin (used as SNI). |
+| **Service discovery** | Cloud Map private namespace for Keycloak Infinispan JGroups DNS_PING. |
+| **Secrets Manager** | Three secrets: AD admin password, Keycloak admin credentials, Aurora master credentials. |
+| **CloudWatch Logs** | `/ecs/keycloak`, 30-day retention, ECS Container Insights enabled. |
 
-### 共用组件（两个场景都有）
+## Prerequisites
 
-| 组件 | 单价 | 月成本 |
-|---|---|---|
-| ALB（Application LB-hour + ~1 LCU） | $0.0225/hr + $0.008/LCU-hr | **$22.27** |
-| ECS Fargate（2 vCPU + 4 GB，24/7）| $0.04048/vCPU-hr + $0.004445/GB-hr | **$72.08** |
-| Aurora Serverless v2 (PostgreSQL，平均 0.7 ACU + 5GB) | $0.12/ACU-hr | **$61.82** |
-| CloudFront (PriceClass_All，<10GB egress/月) | $0.085/GB + $0.0075/10K req | **~$1.00** |
-| Route53 (1 hosted zone + queries) | $0.50/zone/月 + $0.40/M | **~$0.60** |
-| Secrets Manager (3 secrets) | $0.40/secret/月 | **$1.20** |
-| CloudWatch Logs (~2 GB/月 ingest+store) | $0.50/GB ingest + $0.03/GB-mo | **~$1.00** |
-| NAT Gateway (现有 VPC 复用 1 个) | $0.045/hr + 数据 | **$32.85** |
-| ACM 证书 | 免费 | $0 |
-| IAM Identity Center | 免费 | $0 |
-| **共用合计** | | **~$192.82 / 月** |
+- AWS account in `us-east-1` (CloudFront ACM and Quick Desktop are us-east-1 only)
+- An existing VPC with public + private subnets across at least two Availability Zones, plus a NAT Gateway
+- A Route 53 public hosted zone
+- An ACM certificate in **us-east-1** covering both your Keycloak public domain and an internal origin alias (for example a wildcard `*.example.com`)
+- Service Quota `VPC L-0EA8095F` (inbound rules per security group) raised to **≥ 200** — the CloudFront origin-facing prefix list reference counts ~45 entries against the SG limit
+- An existing Amazon Quick (Suite) Enterprise subscription
+- For `SCENARIO=ad`: account must be in the AWS Organizations management account or delegated admin
 
-### 场景 1（IdC backed）总成本
+## Quick Deploy
 
-| 组件 | 月成本 |
-|---|---|
-| 共用合计 | $192.82 |
-| Managed AD（**可选**，本场景 SSO 链路不需要 LDAP） | $0（不部署）  /  +$87.60（保留给将来用） |
-| **场景 1 合计** | **~$192.82** （或保留 AD 时 ~$280.42） |
+### 1. Configure environment
 
-> 场景 1 推荐**不部署 Managed AD**：可以把 `01-managed-ad.yaml` 跳过，相关 `.env` 字段
-> 留空，`02-keycloak-infra.yaml` 的 `ManagedADDnsIp1/2` 用 dummy 值（LDAP federation
-> 不在登录链路里），整套架构不依赖 AD。
-
-### 场景 2（AD backed）总成本
-
-| 组件 | 月成本 |
-|---|---|
-| 共用合计 | $192.82 |
-| AWS Managed Microsoft AD Standard（2 DC × $0.06/hr × 730 hr）**必需** | **$87.60** |
-| （或升级到 Enterprise，2 DC × $0.20/hr × 730 hr） | $292.00 |
-| **场景 2 合计（Standard）** | **~$280.42** |
-| **场景 2 合计（Enterprise）** | ~$484.82 |
-
-### 两场景净差额
-
-> **场景 2 比场景 1 多 ~$87.60/月**（不计可选 AD），即 Managed AD Standard 的固定费用。
-> 用户量 < 5,000 时 Standard 够用；超过则要 Enterprise（再贵 $204.40/月）。
-
-> ⚠️ 价格估算假设：单 task、低流量、平均负载。实际跑生产请按真实 LCU、ACU、egress、
-> Logs ingest 量重估。Aurora 在峰值会 scale 到 4 ACU（短时 ~$350/月 等价），LCU 在突发
-> 流量可飙到 10+。
-
-## 文件清单
-
-| 文件 | 作用 |
-|---|---|
-| `DEPLOYMENT.md` | **从零开始的完整部署指南，先看这个** |
-| `.env.example` | 环境变量模板，复制成 `.env` 后填值 |
-| `01-managed-ad.yaml` | CFN: AWS Managed AD（场景 1 可选 / 场景 2 必需） |
-| `02-keycloak-infra.yaml` | CFN: Keycloak ECS + Aurora + ALB |
-| `02b-cloudfront.yaml` | CFN: CloudFront 前置 |
-| `03-keycloak-realm-config.md` | 手动: 首次创建 realm + LDAP（场景 2）+ 浏览器自检 |
-| `04a-identity-center-setup.md` | 手动（场景 1 only）: IdC 创建 Custom SAML application |
-| `04b-ad-quick-setup.md` | 手动（场景 2 only）: AD 用户/组 + Quick 重订阅 AD-backed |
-| `05-quick-extension-access.md` | 手动: Quick 控制台 Extension Access（两场景共用） |
-| `deploy-infra.sh` | 自动: 串联 3 个 CFN stack + Route53 alias + 健康检查 |
-| `configure-keycloak.sh` | 自动: 按 SCENARIO 配 SAML IdP / 禁 SAML + OIDC public client |
-| `ad-setup-quick.sh` | 自动（场景 2）: 用 ds-data API 建 AD 用户/组 |
-| `verify-oidc.sh` | 验证: Keycloak OIDC discovery / JWKS / client / SAML IdP |
-| `verify-ldap.sh` | 验证: ECS → Managed AD 的 LDAP 链路 |
-| `inspect-keycloak.sh` | 排障: 当前 Keycloak realm / IdP / client 状态快照 |
-| `inspect-keycloak-ldap.sh` | 排障（场景 2）: 验 LDAP federation + email mapper + 用户同步 |
-| `inspect-ad.sh` | 排障（场景 2）: AD 用户/组当前状态 |
-| `test-keycloak-ldap-login.sh` | 验证（场景 2）: 模拟 AD 用户走完整 OIDC password grant |
-| `disable-saml-idp.sh` | 工具（场景 2 切换）: 把 SAML IdP 禁用 |
-
-## 5 分钟看懂执行顺序
-
-```
-.env (填值，含 SCENARIO)
-  ↓
-deploy-infra.sh                           ← Phase 1: 3 套 CFN stack
-  ↓
-[手动] 03 §1: Keycloak Admin UI 建 realm
-  ↓
-分支：
-  场景 1: [手动] 04a: IdC 控制台建 SAML application + 下载 metadata
-  场景 2: [手动] 04b: 建 AD 用户/组 → 取消旧 Quick 订阅 → 重订阅 AD-backed
-  ↓
-configure-keycloak.sh                     ← Phase 2: SAML IdP / 禁 SAML + OIDC client
-  ↓
-verify-oidc.sh                            ← 全绿才往下走
-  ↓
-[手动] 05: Quick 控制台填 Extension Access
-  ↓
-装 Quick Desktop，点 Enterprise login，端到端验证
+```bash
+git clone https://github.com/dzkd2007/keycloaks-Quick-Desktop-SSO.git
+cd keycloaks-Quick-Desktop-SSO
+cp .env.example .env
+chmod 600 .env
+$EDITOR .env   # see DEPLOYMENT.md §3 for every variable
 ```
 
-详细步骤、前置条件、参数说明、故障排查见 **[DEPLOYMENT.md](./DEPLOYMENT.md)**。
+Pick your scenario by setting `SCENARIO=idc` or `SCENARIO=ad` in `.env`.
 
-## 设计要点（不要踩）
+### 2. Provision infrastructure
 
-通用：
-- **`redirect_uri = http://localhost:18080`** 是 Quick Desktop 写死的，不能改
-- **OIDC client 必须 public + PKCE S256**，不能藏 client secret
-- **必须 us-east-1**：CloudFront ACM 要求 us-east-1，Quick Desktop 也只在 us-east-1
-- **CloudFront 必须 `CachingDisabled`**：OIDC token / JWKS 不能被边缘缓存
-- **ALB SG 不能 `0.0.0.0/0`**：合规；用 CloudFront origin-facing prefix list 替代
-- **ECS task 子网必须和 ALB 至少一个 AZ 重合**
+```bash
+./deploy-infra.sh
+```
 
-场景 1：
-- **IdC ACS URL 路径里的 alias** 必须等于 Keycloak SAML IdP 的 alias，改一边就要改另一边
-- **不要切 IdC identity source**，会清空所有 user/group assignments
+Runs three CloudFormation stacks in sequence (Managed AD ≈ 30 min on first create; Keycloak ≈ 10 min; CloudFront ≈ 5–10 min) and updates Route 53 to point your Keycloak domain at CloudFront.
 
-场景 2：
-- **AD 用户必须有 `mail` 属性**，否则 id_token 里 email 为空 → 登 Quick Desktop 失败
-- **Quick 订阅是不可逆的 identity 选择**：要换 identity type 必须 unsubscribe 再 subscribe
-- **3 个 AD group 必须在订阅 Quick 时绑定**（之后改不了 group ↔ role 映射）
+### 3. Bootstrap the Keycloak realm
+
+Open `https://<KEYCLOAK_DOMAIN>/admin`, sign in as the Keycloak admin, and create realm `quicksuite`. See [03-keycloak-realm-config.md](03-keycloak-realm-config.md) for the full settings (and for `SCENARIO=ad`, the LDAP federation).
+
+### 4. Configure the identity backend (scenario-specific)
+
+| Scenario | What to do | Document |
+|----------|------------|----------|
+| `idc` | Create a Customer Managed SAML 2.0 application in IAM Identity Center, download metadata as `idc-saml-metadata.xml`, assign users. | [04a-identity-center-setup.md](04a-identity-center-setup.md) |
+| `ad`  | Run `./ad-setup-quick.sh` to create test groups/users in Managed AD, then unsubscribe and re-subscribe Amazon Quick with **Active Directory** as the identity type, binding the new groups to roles. | [04b-ad-quick-setup.md](04b-ad-quick-setup.md) |
+
+### 5. Wire up Keycloak
+
+```bash
+./configure-keycloak.sh
+./verify-oidc.sh
+```
+
+`configure-keycloak.sh` is idempotent. It branches on `SCENARIO`: it creates the SAML Identity Provider for `idc`, disables it for `ad`, and in both cases creates the OIDC public client `amazon-quick-desktop` (PKCE S256, redirect URI `http://localhost:18080`).
+
+`verify-oidc.sh` should report `OK — Keycloak side looks good.`
+
+### 6. Register the Extension Access in the Amazon Quick console
+
+Add an Extension Access of type **Desktop application for Quick** with the OIDC endpoints emitted by `verify-oidc.sh`. See [05-quick-extension-access.md](05-quick-extension-access.md).
+
+### 7. Test
+
+Install Amazon Quick Desktop, click **Enterprise login**, and complete the flow. See [DEPLOYMENT.md §9](DEPLOYMENT.md#9-phase-6装-quick-desktop-端到端验证) for what to expect at each redirect.
+
+## Parameters
+
+`.env` is the single source of truth; every script and CFN command reads from it.
+
+| Variable | Required for | Description |
+|----------|-------------|-------------|
+| `SCENARIO` | both | `idc` or `ad` — selects identity backend. |
+| `AWS_REGION`, `AWS_ACCOUNT_ID` | both | Must be `us-east-1`. |
+| `VPC_ID`, `PRIVATE_SUBNET_1`, `PRIVATE_SUBNET_2`, `PUBLIC_SUBNET_1`, `PUBLIC_SUBNET_2`, `ECS_SUBNET` | both | Network layout. ECS subnet must share an AZ with at least one ALB public subnet. |
+| `ROUTE53_HOSTED_ZONE_ID`, `KEYCLOAK_DOMAIN`, `ORIGIN_ALIAS_NAME`, `CERTIFICATE_ARN` | both | Public domain, internal SNI alias, ACM cert (in `us-east-1`). |
+| `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` | both | Keycloak master admin. |
+| `DB_MASTER_USERNAME`, `DB_MASTER_PASSWORD` | both | Aurora master credentials. |
+| `AD_DOMAIN_NAME`, `AD_SHORT_NAME`, `AD_ADMIN_PASSWORD`, `AD_EDITION` | scenario `ad` (required); scenario `idc` (only if you also want LDAP federation) | Managed AD parameters. |
+| `IDC_INSTANCE_ARN`, `IDC_IDENTITY_STORE_ID`, `IDC_SAML_METADATA_FILE` | scenario `idc` | Identity Center coordinates and the metadata file you downloaded in Step 4a. |
+| `AD_TEST_USER_SAM`, `AD_TEST_USER_EMAIL`, `AD_TEST_USER_PASSWORD` | scenario `ad` | Used by `ad-setup-quick.sh`. |
+| `KEYCLOAK_REALM`, `KEYCLOAK_OIDC_CLIENT_ID`, `KEYCLOAK_IDP_ALIAS` | both | Defaults are sensible (`quicksuite`, `amazon-quick-desktop`, `iam-identity-center`). |
+
+## Security Notes
+
+- The ALB Security Group **must not** allow `0.0.0.0/0`. Ingress is restricted to `pl-3b927c52` (CloudFront origin-facing managed prefix list); CloudFront re-validates the host via SNI against the ACM cert.
+- The Keycloak admin console is reachable only through CloudFront; restrict console access at the application layer (admin password rotation, IP-based admin policy, or a separate WAF rule).
+- The OIDC client is **public** with PKCE S256 — there is no client secret to leak. Any tampering with the redirect URI breaks the flow.
+- Aurora is encrypted at rest, has a 7-day automated backup retention, and uses `DeletionPolicy: Snapshot`.
+- All credentials live only in `.env` and Secrets Manager. `.env` is `.gitignore`-d.
+- The Quick subscription identity choice **cannot** be changed after creation; switching scenarios on an existing Quick account requires unsubscribing first.
+
+## Deployment Timeline
+
+The orchestrator (`deploy-infra.sh`) takes approximately **45–60 minutes** end to end on a clean account:
+
+1. Pre-flight checks (CLI / region / ACM / Route 53)
+2. CFN: Managed AD ≈ 30 min on first create
+3. CFN: Keycloak ECS + Aurora + ALB ≈ 10 min
+4. CFN: CloudFront ≈ 5–10 min
+5. Route 53 alias update + healthcheck wait
+
+Manual phases (realm, identity backend, Quick console) add roughly another 30–45 minutes.
+
+## Cost Estimate
+
+Monthly estimate for `us-east-1`, On-Demand, single-task / low-traffic SSO. Pricing pulled from the AWS Pricing API.
+
+### Shared infrastructure
+
+| Component | Calculation | Monthly |
+|-----------|-------------|--------:|
+| ECS Fargate (2 vCPU + 4 GB, 24/7) | $0.04048/vCPU-hr × 2 + $0.004445/GB-hr × 4, × 730 hr | **$72.08** |
+| Application Load Balancer (≈ 1 LCU) | $0.0225/hr × 730 + $0.008 × 730 | **$22.27** |
+| Aurora Serverless v2 (avg 0.7 ACU + 5 GB storage) | $0.12/ACU-hr × 0.7 × 730 + $0.10/GB-month | **$61.82** |
+| CloudFront (PriceClass_All, < 10 GB egress) | $0.085/GB + $0.0075/10K req | ~$1.00 |
+| Route 53 (1 hosted zone) | $0.50/zone-month + queries | ~$0.60 |
+| Secrets Manager (3 secrets) | $0.40/secret-month | $1.20 |
+| CloudWatch Logs (≈ 2 GB ingest+store) | $0.50/GB ingest + $0.03/GB-month | ~$1.00 |
+| NAT Gateway (1 reused from existing VPC) | $0.045/hr × 730 | $32.85 |
+| ACM, IAM Identity Center | — | $0 |
+| **Shared total** | | **≈ $192.82** |
+
+### Scenario 1 — IdC backed
+
+| | Monthly |
+|---|--------:|
+| Shared total | $192.82 |
+| Managed AD (optional, recommend skipping for this scenario) | $0 (skip) or +$87.60 (Standard, kept for future use) |
+| **Scenario 1 total** | **≈ $192.82** (or ≈ $280.42 if AD is kept) |
+
+### Scenario 2 — AD backed
+
+| | Monthly |
+|---|--------:|
+| Shared total | $192.82 |
+| AWS Managed Microsoft AD **Standard** (2 DCs × $0.06/hr × 730) | **+$87.60** |
+| **Scenario 2 total (Standard)** | **≈ $280.42** |
+| Scenario 2 total (Enterprise, > 5,000 users) | ≈ $484.82 |
+
+The net delta between scenarios is the Managed AD bill (~$88/month for Standard; ~$292/month for Enterprise). All other components are identical.
+
+> Estimates assume single-task, low traffic, average 0.7 ACU. Real production workloads should re-estimate by measured LCU, ACU usage, egress, and Logs ingestion. Aurora can scale to 4 ACU on bursts (~$350/month equivalent at full capacity).
+
+## Cleanup
+
+Manual UI steps first, then CFN stacks in reverse order:
+
+```bash
+# 1. Quick console: delete the Extension and Extension Access
+# 2. Scenario 1: IdC console → Applications → Customer managed → delete the SAML application
+#    Scenario 2: optionally clean up AD test users / groups via aws ds-data delete-*
+# 3. Route 53: delete the Keycloak A-alias record
+# 4. CFN stacks (reverse order)
+aws cloudformation delete-stack --stack-name quicksuite-keycloak-cf --region us-east-1
+aws cloudformation wait stack-delete-complete --stack-name quicksuite-keycloak-cf --region us-east-1
+
+aws cloudformation delete-stack --stack-name quicksuite-keycloak --region us-east-1
+aws cloudformation wait stack-delete-complete --stack-name quicksuite-keycloak --region us-east-1
+# Aurora has DeletionPolicy: Snapshot — a final snapshot is retained.
+
+aws cloudformation delete-stack --stack-name quicksuite-managed-ad --region us-east-1
+aws cloudformation wait stack-delete-complete --stack-name quicksuite-managed-ad --region us-east-1
+```
+
+The ACM certificate, Route 53 hosted zone, VPC, NAT Gateway, and Quick subscription are not created by this template and are left untouched.
+
+## Repository Layout
+
+| File | Purpose |
+|------|---------|
+| `DEPLOYMENT.md` | Full step-by-step walkthrough — start here on first deploy. |
+| `.env.example` | Environment variable template. |
+| `01-managed-ad.yaml` | CFN: AWS Managed Microsoft AD. |
+| `02-keycloak-infra.yaml` | CFN: Keycloak ECS + Aurora + ALB. |
+| `02b-cloudfront.yaml` | CFN: CloudFront fronting the ALB. |
+| `03-keycloak-realm-config.md` | Manual Admin UI steps for both scenarios. |
+| `04a-identity-center-setup.md` | Scenario 1 — IdC SAML application. |
+| `04b-ad-quick-setup.md` | Scenario 2 — AD users/groups + Quick AD-backed re-subscription. |
+| `05-quick-extension-access.md` | Manual: register the OIDC endpoints in the Quick console. |
+| `deploy-infra.sh` | Orchestrates the three CFN deploys + Route 53 + healthcheck. |
+| `configure-keycloak.sh` | Idempotent realm wiring (SAML IdP for `idc`, OIDC client always). |
+| `ad-setup-quick.sh` | Scenario 2 — creates AD groups + test user via the Directory Service Data API. |
+| `verify-oidc.sh` | OIDC discovery + JWKS + client + IdP sanity checks. |
+| `verify-ldap.sh` | LDAP reachability + bind from inside the ECS task. |
+| `inspect-keycloak.sh` | Read-only Keycloak realm/IdP/client snapshot. |
+| `inspect-keycloak-ldap.sh` | Scenario 2 — LDAP federation mappers + user sync verification. |
+| `inspect-ad.sh` | Scenario 2 — current AD users and groups. |
+| `test-keycloak-ldap-login.sh` | Scenario 2 — full OIDC password grant against AD. |
+| `disable-saml-idp.sh` | Toggles off the SAML IdP when switching `idc` → `ad`. |
+
+## License
+
+[MIT](LICENSE)
