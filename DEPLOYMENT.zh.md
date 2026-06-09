@@ -54,14 +54,65 @@ aws quicksight describe-account-subscription \
 
 ## 2. 前置资源
 
-### 工具
+### 本地工具链
 
-| 工具 | 版本 |
+| 工具 | 最低版本 | 用在哪 |
+|------|---------|--------|
+| `bash` | 3.2+（macOS / Linux 自带） | 所有脚本（`#!/usr/bin/env bash` shebang） |
+| `python3` | 3.8+ | 脚本内联 JSON 解析（含 f-string） |
+| `aws`（AWS CLI v2） | 2.15+ | 需要 `ds-data` 与较新的 `sso-admin` 子命令 |
+| `curl` | 任意现代版本 | 调 Keycloak Admin REST 和 OIDC discovery |
+| `git` | 任意 | clone 仓库 |
+| **AWS Session Manager 插件** | 最新 | `aws ecs execute-command` 必需，`verify-ldap.sh` / `inspect-ad.sh` 用 |
+
+`sed` / `awk` / `grep` / `tr` / `base64` / `find` 都是 macOS / Linux 自带的 coreutils。Windows 用户必须在 **WSL2** 或 Linux 虚拟机里跑 —— 原生 CMD / PowerShell 不解析 bash shebang。
+
+安装 Session Manager 插件：
+
+```bash
+# macOS（Homebrew）
+brew install --cask session-manager-plugin
+
+# Ubuntu / Debian
+curl -L "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+  -o /tmp/session-manager-plugin.deb
+sudo dpkg -i /tmp/session-manager-plugin.deb
+
+# 自检
+session-manager-plugin --version
+```
+
+跑任何脚本前先配置 AWS CLI 默认凭据：
+
+```bash
+aws configure              # 交互式
+# 或者用环境变量：AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+aws sts get-caller-identity   # 确认是正确的账号
+```
+
+### AWS IAM 权限
+
+部署会跨多个服务。最简单的做法是用 `AdministratorAccess`。对权限更严的环境，至少要：
+
+| 服务 | 用途 |
 |------|------|
-| AWS CLI | v2.x |
-| `python3` | ≥ 3.8 |
-| `curl` | 任意现代版本 |
-| `git` | 用于 clone 仓库 |
+| **CloudFormation** | `cloudformation:*` 部署 / 更新 / 删除三套 stack |
+| **IAM** | 创建并 pass role 给 ECS task / RDS monitoring / Directory Service。`iam:CreateServiceLinkedRole`（ECS / DirectoryService / RDS） |
+| **EC2 / VPC** | 读 VPC + 子网、管理 security group、管理 `AWS::EC2::DHCPOptions`（`01-managed-ad.yaml` 用） |
+| **ECS** | `ecs:*` 作用于 cluster `keycloak-cluster`；**`ecs:ExecuteCommand`** 给 `verify-ldap.sh` / `inspect-ad.sh` |
+| **RDS** | Aurora Serverless v2 cluster + instances + final snapshot |
+| **Directory Service + Directory Service Data** | `ds:CreateMicrosoftAD`、`ds:DescribeDirectories`、`ds:ResetUserPassword`、`ds:EnableDirectoryDataAccess`；场景 2 还需要 `ds-data:*` |
+| **Secrets Manager** | 创建 / 读取 3 个 secret（AD admin、Keycloak admin、Aurora master） |
+| **Route 53** | hosted zone 上的 `ChangeResourceRecordSets` 与 `GetHostedZone` |
+| **ACM** | 仅 `acm:DescribeCertificate`（证书本身预先存在 `us-east-1`） |
+| **CloudFront** | 管理一个 distribution |
+| **Cloud Map（Service Discovery）** | Keycloak Infinispan JGroups 用的 private namespace + service |
+| **CloudWatch Logs** | 创建 / 写入日志组 `/ecs/keycloak` + Container Insights |
+| **STS / Organizations** | `sts:GetCallerIdentity`、`organizations:DescribeOrganization`（pre-flight） |
+| **IAM Identity Center** | `sso-admin:*` + `identitystore:*` —— 场景 1 only（Customer Managed SAML application） |
+| **Amazon Quick（QuickSight）** | `quicksight:DescribeAccountSubscription`（pre-flight）；订阅、Extension Access 等操作需要 Quick Web 控制台的管理员级权限 |
+
+场景 2 必须在 **AWS Organizations master account** 或 Directory Service **delegated administrator** 账号下跑 —— Managed AD 仅允许从这两类账号注入 IAM Identity Center。
 
 ### 服务配额
 

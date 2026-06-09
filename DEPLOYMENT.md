@@ -52,14 +52,65 @@ aws quicksight describe-account-subscription \
 
 ## 2. Prerequisites
 
-### Tooling
+### Local toolchain
 
-| Tool | Version |
-|------|---------|
-| AWS CLI | v2.x |
-| `python3` | ≥ 3.8 |
-| `curl` | any modern build |
-| `git` | for cloning the repo |
+| Tool | Minimum | Where it is used |
+|------|---------|------------------|
+| `bash` | 3.2+ (default on macOS / Linux) | All scripts use `#!/usr/bin/env bash` |
+| `python3` | 3.8+ | Inline JSON parsing inside scripts (uses f-strings) |
+| `aws` (AWS CLI v2) | 2.15+ | Required for the `ds-data` and recent `sso-admin` subcommands |
+| `curl` | any modern build | Keycloak Admin REST + OIDC discovery |
+| `git` | any | Cloning the repo |
+| **AWS Session Manager plugin** | latest | Required by `aws ecs execute-command`; `verify-ldap.sh` and `inspect-ad.sh` rely on it |
+
+`sed`, `awk`, `grep`, `tr`, `base64`, `find` ship as part of coreutils on macOS / Linux. Windows users must run from **WSL2** or a Linux VM — native CMD / PowerShell will not execute the bash shebang.
+
+Install the Session Manager plugin:
+
+```bash
+# macOS (Homebrew)
+brew install --cask session-manager-plugin
+
+# Ubuntu / Debian
+curl -L "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+  -o /tmp/session-manager-plugin.deb
+sudo dpkg -i /tmp/session-manager-plugin.deb
+
+# Sanity-check
+session-manager-plugin --version
+```
+
+Configure AWS CLI default credentials before running any script:
+
+```bash
+aws configure              # interactive
+# or set env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+aws sts get-caller-identity   # confirm the right account
+```
+
+### AWS IAM permissions
+
+The deployment touches many services. The simplest is to run with `AdministratorAccess`. For more restricted environments, the principal needs at least:
+
+| Service | Why |
+|---------|-----|
+| **CloudFormation** | `cloudformation:*` to deploy / update / delete the three stacks |
+| **IAM** | Create and pass roles for ECS task, RDS monitoring, Directory Service. `iam:CreateServiceLinkedRole` for ECS / DirectoryService / RDS |
+| **EC2 / VPC** | Read VPC + subnets, manage security groups, manage `AWS::EC2::DHCPOptions` (used by `01-managed-ad.yaml`) |
+| **ECS** | `ecs:*` on cluster `keycloak-cluster`; **`ecs:ExecuteCommand`** for `verify-ldap.sh` / `inspect-ad.sh` |
+| **RDS** | Aurora Serverless v2 cluster + instances + final snapshot |
+| **Directory Service + Directory Service Data** | `ds:CreateMicrosoftAD`, `ds:DescribeDirectories`, `ds:ResetUserPassword`, `ds:EnableDirectoryDataAccess`; Scenario 2 also needs `ds-data:*` |
+| **Secrets Manager** | Create / read 3 secrets (AD admin, Keycloak admin, Aurora master) |
+| **Route 53** | `ChangeResourceRecordSets` and `GetHostedZone` on the hosted zone |
+| **ACM** | `acm:DescribeCertificate` only (the certificate itself must already exist in `us-east-1`) |
+| **CloudFront** | Manage one distribution |
+| **Cloud Map (Service Discovery)** | Private namespace + service used by Keycloak Infinispan JGroups |
+| **CloudWatch Logs** | Create / write log group `/ecs/keycloak` and Container Insights |
+| **STS / Organizations** | `sts:GetCallerIdentity`, `organizations:DescribeOrganization` (pre-flight) |
+| **IAM Identity Center** | `sso-admin:*` and `identitystore:*` — Scenario 1 only, for the Customer Managed SAML application |
+| **Amazon Quick (QuickSight)** | `quicksight:DescribeAccountSubscription` (pre-flight). The Quick console operations (subscribing, Extension Access) require admin-level access in the Quick web UI itself. |
+
+For Scenario 2 the account must be in the **AWS Organizations management account** or a Directory Service **delegated administrator** account — Managed AD only allows IAM Identity Center attachment from those positions.
 
 ### Service quota
 

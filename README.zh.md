@@ -64,13 +64,88 @@ flowchart LR
 
 ## 前提条件
 
-- AWS 账号在 `us-east-1`（CloudFront ACM 与 Quick Desktop 仅支持 us-east-1）
-- 已有 VPC，公有/私有子网各跨 ≥ 2 个 AZ，并且有 NAT Gateway
-- 已有 Route 53 公网 hosted zone
-- 已有 **us-east-1** 的 ACM 证书，覆盖 Keycloak 公网域名 + 一个内部源站 alias（最简单做一张通配 `*.example.com`）
-- 服务配额 `VPC L-0EA8095F`（每 SG 入站规则数）≥ **200** —— CloudFront origin-facing prefix list 单条引用就 ~45 条 entry，默认 60 不够
-- 已有 Amazon Quick (Suite) Enterprise 订阅
-- 场景 2：账号必须是 AWS Organizations master 或 delegated admin
+### 本地工具链
+
+| 工具 | 最低版本 | 用在哪 |
+|------|---------|-------|
+| `bash` | 3.2+（macOS / Linux 自带） | 所有脚本（shebang `#!/usr/bin/env bash`） |
+| `python3` | 3.8+ | 脚本内联 JSON 解析（含 f-string） |
+| `aws`（AWS CLI v2） | 2.15+ | 需要 `ds-data` 与较新的 `sso-admin` 子命令 |
+| `curl` | 任意现代版本 | 调 Keycloak Admin REST 和 OIDC discovery |
+| `git` | 任意 | clone 仓库 |
+| **Session Manager 插件** | 最新 | `aws ecs execute-command` 必需，`verify-ldap.sh` / `inspect-ad.sh` 用 |
+
+安装 Session Manager 插件：
+
+```bash
+# macOS（Homebrew）
+brew install --cask session-manager-plugin
+
+# Ubuntu / Debian
+curl -L "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+  -o /tmp/session-manager-plugin.deb
+sudo dpkg -i /tmp/session-manager-plugin.deb
+
+# 验证
+session-manager-plugin --version
+```
+
+`sed` / `awk` / `grep` / `tr` / `base64` / `find` 都是 coreutils，macOS 和现代 Linux 自带。Windows 用户必须在 **WSL2**（Ubuntu）或 Linux 虚拟机里跑 —— 原生 CMD / PowerShell 跑不了 bash 脚本。
+
+### AWS 账号与 IAM 权限
+
+部署会跨多个服务。一次性安装最简单是用具有 `AdministratorAccess` 的主体；对权限更严格的环境，至少需要：
+
+| 服务 | 用途 |
+|------|------|
+| **CloudFormation** | `cloudformation:*` 部署三套 stack |
+| **IAM** | 创建 / pass role 给 ECS task / RDS / Directory Service |
+| **EC2 / VPC** | 管理 security group 与 Managed AD 的可选 DHCP options |
+| **ECS** | Cluster / Task Definition / Service / **`ecs:ExecuteCommand`** |
+| **RDS** | Aurora cluster + instance + snapshot |
+| **Directory Service + Directory Service Data** | 建 / 读 AD；场景 2 还要 `ds:EnableDirectoryDataAccess` 与 `ds-data:*` |
+| **Secrets Manager** | 3 个 secret（AD admin、Keycloak admin、Aurora master） |
+| **Route 53** | 公网 hosted zone 上的 `ChangeResourceRecordSets` |
+| **ACM** | 仅 `DescribeCertificate`（证书本身预先存在） |
+| **CloudFront** | 管理一个 distribution |
+| **Service Discovery (Cloud Map)** | 给 Keycloak Infinispan 用的 private namespace |
+| **CloudWatch Logs** | `/ecs/keycloak` 日志组 + Container Insights |
+| **STS / Organizations** | `GetCallerIdentity`、`DescribeOrganization`（pre-flight） |
+| **IAM Identity Center** | `sso-admin:*`、`identitystore:*`（场景 1 only） |
+| **Amazon Quick（QuickSight）** | `quicksight:DescribeAccountSubscription`（pre-flight）与控制台管理员级权限（订阅、Extension Access） |
+
+### 服务配额
+
+CloudFront origin-facing 托管 prefix list 单条引用按 list 当前 entry 数（~45）计入 SG 入站规则配额。默认 60/SG 不够，先提工单调高：
+
+```
+Service: VPC
+Quota:   L-0EA8095F  (Inbound or outbound rules per security group)
+请求值:  200
+```
+
+通常 1–3 工作日批。
+
+### 网络
+
+| 资源 | 要求 |
+|------|------|
+| VPC | 已存在，含 NAT Gateway（私有子网能出公网拉镜像） |
+| 私有子网 | ≥ 2 个，跨 AZ（Aurora 子网组要求） |
+| 公有子网 | ≥ 2 个，跨 AZ（ALB 跨 AZ 要求） |
+| ECS task 子网 | 私有子网中 AZ 必须**至少**和某个公有子网重合，否则 ALB target 会被标 `unused` |
+
+### 域名 + ACM 证书
+
+- Route 53 公网 hosted zone
+- 准备两个域名：
+  - `KEYCLOAK_DOMAIN` —— 用户访问入口，例 `keycloak.example.com`
+  - `ORIGIN_ALIAS_NAME` —— CloudFront 回源 SNI 用，例 `kc-origin.example.com`
+- ACM 证书（**必须 us-east-1**）覆盖两个域名 —— 最简单做一张通配 `*.example.com`
+
+### Amazon Quick 订阅
+
+需要 Enterprise edition、home region `us-east-1`。订阅时 identity 选错没关系（场景 2 通过 unsubscribe + re-subscribe 切回 AD）。
 
 ## 快速部署
 

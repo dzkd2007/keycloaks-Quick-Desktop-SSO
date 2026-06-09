@@ -64,13 +64,88 @@ In both cases the Desktop client receives an OIDC `id_token` whose `email` claim
 
 ## Prerequisites
 
-- AWS account in `us-east-1` (CloudFront ACM and Quick Desktop are us-east-1 only)
-- An existing VPC with public + private subnets across at least two Availability Zones, plus a NAT Gateway
-- A Route 53 public hosted zone
-- An ACM certificate in **us-east-1** covering both your Keycloak public domain and an internal origin alias (for example a wildcard `*.example.com`)
-- Service Quota `VPC L-0EA8095F` (inbound rules per security group) raised to **≥ 200** — the CloudFront origin-facing prefix list reference counts ~45 entries against the SG limit
-- An existing Amazon Quick (Suite) Enterprise subscription
-- For `SCENARIO=ad`: account must be in the AWS Organizations management account or delegated admin
+### Local toolchain
+
+| Tool | Minimum | Where it is used |
+|------|---------|------------------|
+| `bash` | 3.2+ (default on macOS / Linux) | All scripts (`#!/usr/bin/env bash` shebang) |
+| `python3` | 3.8+ | Inline JSON parsing inside scripts (uses f-strings) |
+| `aws` (AWS CLI v2) | 2.15+ | Required for `ds-data` and recent `sso-admin` subcommands |
+| `curl` | any modern build | Keycloak Admin REST and OIDC discovery calls |
+| `git` | any | Cloning the repo |
+| **Session Manager plugin** | latest | Required by `aws ecs execute-command`, used by `verify-ldap.sh` and `inspect-ad.sh` |
+
+Install the Session Manager plugin:
+
+```bash
+# macOS (Homebrew)
+brew install --cask session-manager-plugin
+
+# Ubuntu / Debian
+curl -L "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+  -o /tmp/session-manager-plugin.deb
+sudo dpkg -i /tmp/session-manager-plugin.deb
+
+# Verify
+session-manager-plugin --version
+```
+
+`sed`, `awk`, `grep`, `tr`, `base64`, `find` are part of standard coreutils and are present on macOS and any modern Linux. Windows users should run from **WSL2** (Ubuntu) or a Linux VM — native CMD / PowerShell are not supported because of the bash shebang.
+
+### AWS account & IAM permissions
+
+The deployment provisions resources across many services. The simplest route for a one-off install is a principal with `AdministratorAccess`. For tighter environments, the operator role needs at minimum:
+
+| Service | Why |
+|---------|-----|
+| **CloudFormation** | `cloudformation:*` to deploy the three stacks |
+| **IAM** | Create / pass roles for ECS task / RDS / Directory Service |
+| **EC2 / VPC** | Manage security groups and the optional DHCP options for Managed AD |
+| **ECS** | Cluster, task definition, service, **`ecs:ExecuteCommand`** |
+| **RDS** | Aurora cluster + instances + snapshots |
+| **Directory Service + Directory Service Data** | Create / read AD; Scenario 2 also needs `ds:EnableDirectoryDataAccess` and `ds-data:*` |
+| **Secrets Manager** | Three secrets (AD admin, Keycloak admin, Aurora master) |
+| **Route 53** | `ChangeResourceRecordSets` on the public hosted zone |
+| **ACM** | `DescribeCertificate` only (the cert itself is pre-existing) |
+| **CloudFront** | Manage one distribution |
+| **Service Discovery (Cloud Map)** | Private namespace for Keycloak Infinispan |
+| **CloudWatch Logs** | `/ecs/keycloak` log group + Container Insights |
+| **STS / Organizations** | `GetCallerIdentity`, `DescribeOrganization` (pre-flight) |
+| **IAM Identity Center** | `sso-admin:*`, `identitystore:*` (Scenario 1 only) |
+| **Amazon Quick (QuickSight)** | `quicksight:DescribeAccountSubscription` (pre-flight) and console-level admin (subscribing, Extension Access) |
+
+### Service quota
+
+The CloudFront origin-facing managed prefix list reference counts ~45 entries against a security group's inbound-rule limit. Default is 60, leaving no headroom — raise the quota first.
+
+```
+Service: VPC
+Quota:   L-0EA8095F  (Inbound or outbound rules per security group)
+Request: 200
+```
+
+Approval is usually 1–3 business days.
+
+### Networking
+
+| Resource | Requirement |
+|----------|-------------|
+| VPC | Existing, with a NAT Gateway so private subnets can reach the public internet for image pulls |
+| Private subnets | ≥ 2, in different AZs (Aurora needs a cross-AZ subnet group) |
+| Public subnets | ≥ 2, in different AZs (ALB cross-AZ requirement) |
+| ECS task subnet | A private subnet whose AZ is also covered by one of the public subnets, otherwise ALB targets are marked `unused` |
+
+### Domain & ACM certificate
+
+- Route 53 public hosted zone for your domain.
+- Two hostnames inside the zone:
+  - `KEYCLOAK_DOMAIN` — public entry point, e.g. `keycloak.example.com`
+  - `ORIGIN_ALIAS_NAME` — internal SNI alias used by CloudFront → ALB, e.g. `kc-origin.example.com`
+- ACM certificate **in `us-east-1`** that covers both names. The simplest approach is a wildcard `*.example.com`.
+
+### Amazon Quick subscription
+
+Quick Enterprise edition with home region `us-east-1` is required. The identity choice you make at signup can be wrong — the deployment lets you switch it (Scenario 2) by unsubscribing and re-subscribing.
 
 ## Quick Deploy
 
