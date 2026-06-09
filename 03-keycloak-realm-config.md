@@ -1,52 +1,141 @@
 # Step 3 — Keycloak Realm 配置
 
-> 大部分 Keycloak 配置由 `configure-keycloak.sh` 脚本完成（SAML IdP + 属性 mapper + OIDC public client）。
-> 本文档只覆盖**必须手动做**的两件事：
->   1. 首次创建 realm（脚本要在 realm 已存在的前提下跑）
->   2. 完成后做端到端浏览器验证（如果 Quick Desktop 端报错，回这里看登录页）
+> Keycloak 大部分配置由 `configure-keycloak.sh` 自动完成（OIDC public client，
+> 以及场景 1 的 SAML IdP）。本文档覆盖**必须手动做**的事，按场景分。
+
+## 场景路径速查
+
+| 步骤 | 场景 1 (idc) | 场景 2 (ad) |
+|---|---|---|
+| 1. 创建 realm `quicksuite` | ✅ | ✅ |
+| 2. LDAP federation 连 Managed AD | 可选（保留给将来） | **必需**（密码权威 + 用户来源） |
+| 3. 跑 `configure-keycloak.sh` | ✅（建 SAML IdP + OIDC client） | ✅（禁用 SAML IdP + 建 OIDC client） |
+| 4. 浏览器自检 | ✅ | ✅ |
+
+---
 
 ## 0. 前置条件
 
 - 基础设施 stacks 已部署（`./deploy-infra.sh` 跑完）
-- 可访问 `https://<KEYCLOAK_DOMAIN>/admin`（替换为 `.env` 里的 `KEYCLOAK_DOMAIN`）
-- IdC SAML application 已建（Step 4 完成），`idc-saml-metadata.xml` 已下载到本目录
+- 可访问 `https://<KEYCLOAK_DOMAIN>/admin`
+- **场景 1**: Step 4a 已完成，`idc-saml-metadata.xml` 已下载到本目录
+- **场景 2**: Step 4b 已完成，AD 用户/组已建好，Quick 已重订阅为 AD-backed
 
-## 1. 首次创建 Realm（手动）
+---
+
+## 1. 首次创建 Realm（两个场景都要做）
 
 1. 浏览器打开 `https://<KEYCLOAK_DOMAIN>/admin`
-2. 用 `.env` 里的 `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` 登录
+2. 用 `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` 登录
 3. 左上角 realm 选择器 → **Create Realm**
-4. **Realm name** 填 `.env` 里 `KEYCLOAK_REALM` 的值（默认 `quicksuite`）
+4. **Realm name** 填 `KEYCLOAK_REALM` 的值（默认 `quicksuite`）
 5. 点 **Create**
 
-### 调整基础设置
-
-进 **Realm settings**：
+### 调整基础设置（Realm settings）
 
 - **Login** tab
   - User registration: **Off**
-  - Forgot password: **Off**（密码由 IdC 管，不在 Keycloak 重置）
+  - Forgot password: **Off**
   - Login with email: **On**
   - Duplicate emails: **Off**
 - **Tokens** tab
   - Access Token Lifespan: `5 Minutes`
   - SSO Session Idle: `30 Minutes`
   - SSO Session Max: `10 Hours`
-- **Security defenses → Brute Force Detection**
-  - Enabled: **Off**（本 realm 没有本地用户，brute force 检测意义不大）
 
-## 2. 自动配置 SAML IdP + OIDC client
+---
 
-回到 shell：
+## 2. LDAP User Federation（连接 Managed AD）
+
+> **场景 2 必需**（密码归 AD 管，Keycloak 通过 LDAP 校验）。
+> **场景 1 可选**（如果想保留给将来其他应用做 IdP；不做也能跑通 Quick Desktop SSO）。
+
+`User federation` → **Add LDAP providers** → **LDAP**
+
+### 2.1 General options
+
+| 字段 | 值 |
+|---|---|
+| Console display name | `managed-ad` |
+| Vendor | **Active Directory** |
+
+### 2.2 Connection and authentication settings
+
+| 字段 | 值 |
+|---|---|
+| Connection URL | `ldap://<AD_DNS_IP_1>:389 ldap://<AD_DNS_IP_2>:389` |
+| Enable StartTLS | Off |
+| Use Truststore SPI | `Only for ldaps` |
+| Connection pooling | On |
+| Connection timeout | `10000` (ms) |
+| Bind type | `simple` |
+| Bind DN | `CN=Admin,OU=Users,OU=<AD_SHORT_NAME>,<DC=corp,DC=example,DC=com>`（按你的 AD_DOMAIN_NAME 拆 DC） |
+| Bind credentials | `<AD_ADMIN_PASSWORD>` |
+
+点 **Test connection** → `Success` / **Test authentication** → `Success`。
+
+### 2.3 LDAP searching and updating
+
+| 字段 | 值 |
+|---|---|
+| Edit mode | **READ_ONLY** |
+| Users DN | `OU=Users,OU=<AD_SHORT_NAME>,<DC=corp,DC=example,DC=com>` |
+| Username LDAP attribute | `cn`（或 `sAMAccountName`，需与 AD 实际一致；Managed AD 默认 cn ≈ sAMAccountName） |
+| RDN LDAP attribute | `cn` |
+| UUID LDAP attribute | `objectGUID` |
+| User object classes | `person, organizationalPerson, user` |
+| Search scope | `Subtree` |
+
+### 2.4 Synchronization settings
+
+| 字段 | 值 |
+|---|---|
+| Import users | On |
+| Sync registrations | Off |
+| Periodic full sync | On / `604800` 秒（7 天） |
+| Periodic changed users sync | On / `86400` 秒（1 天） |
+
+Save → Action → **Sync all users**。
+
+### 2.5 LDAP attribute mappers（默认就够，确认存在即可）
+
+进 LDAP provider → **Mappers** tab。Keycloak 默认 AD vendor 创建好了：
+
+| Mapper | 类型 | 作用 |
+|---|---|---|
+| email | user-attribute | `user.email <- ldap.mail` |
+| first name | user-attribute | `user.firstName <- ldap.givenName` |
+| last name | user-attribute | `user.lastName <- ldap.sn` |
+| username | user-attribute | `user.username <- ldap.cn` |
+| groups | group-ldap-mapper | 组同步 |
+| MSAD account controls | msad-user-account-control-mapper | 处理禁用/锁定 |
+
+> ✅ **场景 2 必须确认 `email` mapper 存在**，否则 id_token 里的 `email` claim 会空，
+> Quick Desktop 登不上。可以用 `./inspect-keycloak-ldap.sh` 跑一遍自检。
+
+---
+
+## 3. 自动配置 SAML IdP / OIDC client
 
 ```bash
-./configure-keycloak.sh
+# 场景 1
+SCENARIO=idc ./configure-keycloak.sh
+
+# 场景 2
+SCENARIO=ad  ./configure-keycloak.sh
 ```
 
-脚本会幂等地建 / 更新：
-- SAML Identity Provider（alias = `KEYCLOAK_IDP_ALIAS`，从 `idc-saml-metadata.xml` 导入）
-- 3 个 SAML attribute mapper：`email` / `firstName` / `lastName`
-- OIDC public client（id = `KEYCLOAK_OIDC_CLIENT_ID`，PKCE S256，redirect_uri `http://localhost:18080`）
+或者把 `SCENARIO` 直接写进 `.env`，脚本会自动读。
+
+脚本做的事：
+
+| 动作 | 场景 1 | 场景 2 |
+|---|---|---|
+| 从 `idc-saml-metadata.xml` 建 SAML IdP `iam-identity-center` | ✅ | ✗ |
+| 加 SAML attribute mappers (email/firstName/lastName) | ✅ | ✗ |
+| 禁用 SAML IdP（避免登录页冗余按钮） | ✗ | ✅ |
+| 建 / 更新 OIDC public client `amazon-quick-desktop` | ✅ | ✅ |
+| 把 OIDC client 配成 PKCE S256 + redirect_uri=localhost:18080 | ✅ | ✅ |
 
 成功后跑：
 
@@ -54,43 +143,28 @@
 ./verify-oidc.sh
 ```
 
-应该看到 `OK — Keycloak side looks good.`
+应该看到 `OK — Keycloak side looks good.`。
 
-## 3. 浏览器自检（可选但推荐）
+---
 
-跳过 Quick Desktop，直接用浏览器走一遍登录链路验证 SAML brokering 通畅：
+## 4. 浏览器自检
 
-1. 打开 `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>/account`
-2. 应该看到 **Sign in with AWS IAM Identity Center** 按钮
-3. 点按钮 → 跳到 IdC 登录页
-4. 用一个**已 assign 给 IdC SAML application** 的用户登录（Step 4 §3 里 assign 的）
-5. 登录成功后会回到 Keycloak account console
+打开 `https://<KEYCLOAK_DOMAIN>/realms/<KEYCLOAK_REALM>/account`：
 
-如果第 4 步报错，常见原因：
-- "User not assigned to application" → 回 Step 4 §3 把对应用户加到 SAML application
-- "Could not find email address" → IdC 那边 attribute mapping 里 email 没配对，回 Step 4 §2
+**场景 1** 应看到：
+- 一个 **Sign in with AWS IAM Identity Center** 按钮
+- 点按钮 → 跳到 IdC 登录页 → 用 IdC 用户密码登录 → 跳回 Keycloak account console
 
-## 4. （可选）保留 LDAP federation
+**场景 2** 应看到：
+- 标准 username + password 表单（**不应该**有 SAML 按钮）
+- 输入 AD 用户名（如 `quicktest1`）+ AD 密码 → 登录后进 Keycloak account console
 
-如果你要让 Keycloak 同时给其他应用做 IdP 并接 Managed AD，按下面流程加 LDAP
-federation。**Quick Desktop SSO 链路完全不依赖这一步**。
+如果场景 2 的登录页**还**显示 SAML 按钮，是 `configure-keycloak.sh` 没禁用成功，
+重跑一次或者手动到 Identity Providers 里把 `iam-identity-center` 设为 disabled。
 
-`User federation` → **Add LDAP providers** → **LDAP**：
+---
 
-| 字段 | 值 |
-|---|---|
-| Console display name | `managed-ad` |
-| Vendor | **Active Directory** |
-| Connection URL | `ldap://<AD_DNS_IP_1>:389 ldap://<AD_DNS_IP_2>:389` |
-| Bind type | `simple` |
-| Bind DN | `CN=Admin,OU=Users,OU=<AD_SHORT_NAME>,DC=corp,DC=example,DC=com`（按你的域名替换） |
-| Bind credentials | `<AD_ADMIN_PASSWORD>` |
-| Edit mode | **READ_ONLY** |
-| Users DN | `OU=Users,OU=<AD_SHORT_NAME>,DC=corp,DC=example,DC=com` |
-| Username LDAP attribute | `sAMAccountName` |
-| RDN LDAP attribute | `cn` |
-| UUID LDAP attribute | `objectGUID` |
-| User object classes | `person, organizationalPerson, user` |
+## 5. 进入下一步
 
-> Quick Desktop SSO 链路里**不会**用这些 LDAP 同步过来的用户做密码校验。
-> 密码归 IdC 管，Keycloak 这个 realm 唯一登录入口是 SAML IdP `iam-identity-center`。
+跑 `05-quick-extension-access.md` 把 Keycloak OIDC endpoints 注册到 Quick 控制台，
+然后装 Quick Desktop 端到端测。

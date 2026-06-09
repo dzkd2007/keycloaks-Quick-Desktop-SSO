@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# configure-keycloak.sh — Idempotent: build the SAML IdP + OIDC public client
-# in Keycloak realm ${KEYCLOAK_REALM}. Safe to re-run.
+# configure-keycloak.sh — Idempotent Keycloak realm config.
+# Behavior depends on SCENARIO env var:
+#   - SCENARIO=idc : create SAML IdP `${KEYCLOAK_IDP_ALIAS}` from IDC metadata,
+#                    add 3 SAML attribute mappers, create OIDC public client.
+#                    LDAP federation (if any) is left alone.
+#   - SCENARIO=ad  : disable any SAML IdP `${KEYCLOAK_IDP_ALIAS}` (so Keycloak
+#                    falls back to LDAP-federated username/password form),
+#                    create OIDC public client. LDAP federation must already
+#                    exist (configured via Keycloak Admin UI per 03-keycloak-realm-config.md).
 #
-# What this script creates / updates:
-#   1. SAML Identity Provider, alias = ${KEYCLOAK_IDP_ALIAS}
-#      - Imported from IDC_SAML_METADATA_FILE
-#      - Sync mode FORCE, trustEmail on
-#   2. SAML attribute mappers on that IdP: email / firstName / lastName
-#   3. OIDC public client ${KEYCLOAK_OIDC_CLIENT_ID}
-#      - publicClient + PKCE S256
-#      - redirect_uri http://localhost:18080
-#      - default scopes openid/email/profile, optional offline_access
+# Re-runnable.
 
 set -euo pipefail
 cd "$(dirname "$0")"
-
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 
@@ -24,10 +22,10 @@ set -a; . ./.env; set +a
 : "${KEYCLOAK_REALM:?}"
 : "${KEYCLOAK_OIDC_CLIENT_ID:?}"
 : "${KEYCLOAK_IDP_ALIAS:?}"
-: "${IDC_SAML_METADATA_FILE:?}"
+: "${SCENARIO:?must be 'idc' or 'ad'}"
 
-if [[ ! -f "$IDC_SAML_METADATA_FILE" ]]; then
-  echo "ERROR: metadata file not found: $IDC_SAML_METADATA_FILE"; exit 1
+if [[ "$SCENARIO" != "idc" && "$SCENARIO" != "ad" ]]; then
+  echo "ERROR: SCENARIO must be 'idc' or 'ad' (got '$SCENARIO')"; exit 1
 fi
 
 API="https://${KEYCLOAK_DOMAIN}/admin/realms/${KEYCLOAK_REALM}"
@@ -46,20 +44,25 @@ TOKEN=$(get_token)
 AUTH=( -H "Authorization: Bearer $TOKEN" )
 
 ###############################################################################
-# 1) SAML Identity Provider
+# 1) SAML Identity Provider — only for SCENARIO=idc
 ###############################################################################
-echo "[1/4] SAML Identity Provider '$KEYCLOAK_IDP_ALIAS' ..."
+if [[ "$SCENARIO" == "idc" ]]; then
+  echo "[1/4] (idc) SAML Identity Provider '$KEYCLOAK_IDP_ALIAS' ..."
+  : "${IDC_SAML_METADATA_FILE:?}"
+  if [[ ! -f "$IDC_SAML_METADATA_FILE" ]]; then
+    echo "ERROR: IdC SAML metadata file not found: $IDC_SAML_METADATA_FILE"
+    echo "Did you complete Step 4a (download IdC application metadata)?"
+    exit 1
+  fi
 
-# Use Keycloak's import-config endpoint to convert metadata XML -> provider config
-curl -fsS "${AUTH[@]}" \
-  -F "providerId=saml" \
-  -F "file=@${IDC_SAML_METADATA_FILE};type=application/xml" \
-  "$API/identity-provider/import-config" > /tmp/kc_idp_config.json
+  curl -fsS "${AUTH[@]}" \
+    -F "providerId=saml" \
+    -F "file=@${IDC_SAML_METADATA_FILE};type=application/xml" \
+    "$API/identity-provider/import-config" > /tmp/kc_idp_config.json
 
-python3 - <<PYEOF > /tmp/kc_idp_payload.json
+  python3 - <<PYEOF > /tmp/kc_idp_payload.json
 import json
 cfg = json.load(open("/tmp/kc_idp_config.json"))
-# Override / harden the parts we care about
 cfg["nameIDPolicyFormat"] = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
 cfg["principalType"] = "Subject"
 cfg["wantAuthnRequestsSigned"] = "false"
@@ -69,8 +72,7 @@ cfg["postBindingResponse"] = "true"
 cfg["postBindingAuthnRequest"] = "true"
 cfg["validateSignature"] = "true"
 cfg["syncMode"] = "FORCE"
-# Keycloak SP entity ID (audience IdC will assert to)
-cfg["entityId"] = "https://${KEYCLOAK_DOMAIN}/realms/${KEYCLOAK_REALM}".replace("\${KEYCLOAK_DOMAIN}", "${KEYCLOAK_DOMAIN}").replace("\${KEYCLOAK_REALM}", "${KEYCLOAK_REALM}")
+cfg["entityId"] = "https://${KEYCLOAK_DOMAIN}/realms/${KEYCLOAK_REALM}"
 
 payload = {
     "alias": "${KEYCLOAK_IDP_ALIAS}",
@@ -87,49 +89,40 @@ payload = {
 json.dump(payload, open("/tmp/kc_idp_payload.json","w"))
 PYEOF
 
-# Does it already exist?
-HTTP=$(curl -s -o /tmp/kc_idp_existing.json -w "%{http_code}" "${AUTH[@]}" \
-  "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}")
+  HTTP=$(curl -s -o /tmp/kc_idp_existing.json -w "%{http_code}" "${AUTH[@]}" \
+    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}")
+  if [[ "$HTTP" == "200" ]]; then
+    echo "  exists, updating ..."
+    curl -fsS -X PUT "${AUTH[@]}" -H "Content-Type: application/json" \
+      --data @/tmp/kc_idp_payload.json \
+      "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}" > /dev/null
+  else
+    echo "  creating ..."
+    curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
+      --data @/tmp/kc_idp_payload.json \
+      "$API/identity-provider/instances" > /dev/null
+  fi
+  echo "  OK"
 
-if [[ "$HTTP" == "200" ]]; then
-  echo "  exists, updating ..."
-  curl -fsS -X PUT "${AUTH[@]}" -H "Content-Type: application/json" \
-    --data @/tmp/kc_idp_payload.json \
-    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}" > /dev/null
-elif [[ "$HTTP" == "404" ]]; then
-  echo "  creating ..."
-  curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-    --data @/tmp/kc_idp_payload.json \
-    "$API/identity-provider/instances" > /dev/null
-else
-  echo "  unexpected HTTP $HTTP"; cat /tmp/kc_idp_existing.json; exit 1
-fi
-echo "  OK"
-echo
+  echo "[2/4] (idc) SAML attribute mappers (email / firstName / lastName) ..."
+  curl -fsS "${AUTH[@]}" \
+    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}/mappers" \
+    > /tmp/kc_idp_mappers.json
 
-###############################################################################
-# 2) SAML attribute mappers
-###############################################################################
-echo "[2/4] SAML attribute mappers (email / firstName / lastName) ..."
-
-curl -fsS "${AUTH[@]}" \
-  "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}/mappers" \
-  > /tmp/kc_idp_mappers.json
-
-create_mapper() {
-  local name="$1" attr="$2" user_attr="$3"
-  local exists
-  exists=$(python3 - <<PYEOF
+  create_mapper() {
+    local name="$1" attr="$2" user_attr="$3"
+    local exists
+    exists=$(python3 - <<PYEOF
 import json
 arr=json.load(open("/tmp/kc_idp_mappers.json"))
 print("yes" if any(m.get("name")=="$name" for m in arr) else "no")
 PYEOF
 )
-  if [[ "$exists" == "yes" ]]; then
-    echo "  - $name : already exists, skipping"
-    return
-  fi
-  cat > /tmp/kc_mapper.json <<JSON
+    if [[ "$exists" == "yes" ]]; then
+      echo "  - $name : already exists, skipping"
+      return
+    fi
+    cat > /tmp/kc_mapper.json <<JSON
 {
   "name": "$name",
   "identityProviderAlias": "${KEYCLOAK_IDP_ALIAS}",
@@ -141,19 +134,41 @@ PYEOF
   }
 }
 JSON
-  curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-    --data @/tmp/kc_mapper.json \
-    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}/mappers" > /dev/null
-  echo "  - $name : created"
-}
+    curl -fsS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
+      --data @/tmp/kc_mapper.json \
+      "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}/mappers" > /dev/null
+    echo "  - $name : created"
+  }
 
-create_mapper "email"     "email"     "email"
-create_mapper "firstName" "firstName" "firstName"
-create_mapper "lastName"  "lastName"  "lastName"
-echo
+  create_mapper "email"     "email"     "email"
+  create_mapper "firstName" "firstName" "firstName"
+  create_mapper "lastName"  "lastName"  "lastName"
+  echo
+
+else
+  echo "[1/4] (ad) Disable SAML IdP '$KEYCLOAK_IDP_ALIAS' if exists ..."
+  HTTP=$(curl -s -o /tmp/kc_idp_curr.json -w "%{http_code}" "${AUTH[@]}" \
+    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}")
+  if [[ "$HTTP" == "200" ]]; then
+    python3 - <<'PYEOF' > /tmp/kc_idp_disabled.json
+import json
+d = json.load(open("/tmp/kc_idp_curr.json"))
+d["enabled"] = False
+json.dump(d, open("/tmp/kc_idp_disabled.json","w"))
+PYEOF
+    curl -fsS -X PUT "${AUTH[@]}" -H "Content-Type: application/json" \
+      --data @/tmp/kc_idp_disabled.json \
+      "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}" > /dev/null
+    echo "  disabled."
+  else
+    echo "  not present (HTTP $HTTP), nothing to do."
+  fi
+  echo "[2/4] (ad) (LDAP federation expected to be configured via Admin UI; not modified here.)"
+  echo
+fi
 
 ###############################################################################
-# 3) OIDC public client
+# 3) OIDC public client — both scenarios
 ###############################################################################
 echo "[3/4] OIDC public client '$KEYCLOAK_OIDC_CLIENT_ID' ..."
 
@@ -178,14 +193,13 @@ cat > /tmp/kc_client.json <<JSON
 }
 JSON
 
-# upsert
 EXISTING=$(curl -fsS "${AUTH[@]}" \
   "$API/clients?clientId=${KEYCLOAK_OIDC_CLIENT_ID}")
-INTERNAL_ID=$(python3 -c "
-import json
-arr=json.loads('''$EXISTING''')
-print(arr[0]['id'] if arr else '')
-")
+INTERNAL_ID=$(printf '%s' "$EXISTING" | python3 -c '
+import json,sys
+arr=json.load(sys.stdin)
+print(arr[0]["id"] if arr else "")
+')
 
 if [[ -z "$INTERNAL_ID" ]]; then
   echo "  creating ..."
@@ -196,12 +210,11 @@ if [[ -z "$INTERNAL_ID" ]]; then
   echo "  internalId = $INTERNAL_ID"
 else
   echo "  exists ($INTERNAL_ID), updating ..."
-  # Merge new fields into existing
+  printf '%s' "$EXISTING" > /tmp/kc_client_old.json
   python3 - <<PYEOF > /tmp/kc_client_merged.json
 import json
-old = json.loads('''$EXISTING''')[0]
+old = json.load(open("/tmp/kc_client_old.json"))[0]
 new = json.load(open("/tmp/kc_client.json"))
-# preserve id, secret-related fields are irrelevant for public client
 new["id"] = old["id"]
 json.dump(new, open("/tmp/kc_client_merged.json","w"))
 PYEOF
@@ -211,12 +224,11 @@ PYEOF
 fi
 echo "  OK"
 
-# Make sure offline_access is in optional client scopes
-echo "  ensuring scopes (default: openid/email/profile, optional: offline_access) ..."
+echo "  ensuring scopes (default: email/profile, optional: offline_access) ..."
 curl -fsS "${AUTH[@]}" "$API/client-scopes" > /tmp/kc_scopes.json
 
 ensure_scope() {
-  local scope_name="$1" mode="$2"   # mode: default-client-scopes | optional-client-scopes
+  local scope_name="$1" mode="$2"
   local sid
   sid=$(python3 - <<PYEOF
 import json
@@ -227,7 +239,7 @@ for s in arr:
 PYEOF
 )
   if [[ -z "$sid" ]]; then
-    echo "    WARN: realm-level scope '$scope_name' not found; skipping"
+    echo "    (skip $scope_name — realm-level scope not present, e.g. 'openid' is OIDC-protocol-level)"
     return
   fi
   curl -fsS -X PUT "${AUTH[@]}" \
@@ -235,7 +247,6 @@ PYEOF
   echo "    $scope_name -> $mode (set)"
 }
 
-ensure_scope "openid"         "default-client-scopes"
 ensure_scope "email"          "default-client-scopes"
 ensure_scope "profile"        "default-client-scopes"
 ensure_scope "offline_access" "optional-client-scopes"
@@ -248,20 +259,21 @@ echo "[4/4] Verifying final state ..."
 TOKEN=$(get_token)
 AUTH=( -H "Authorization: Bearer $TOKEN" )
 
-curl -fsS "${AUTH[@]}" \
-  "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}" > /tmp/kc_idp_final.json
-python3 - <<'PYEOF'
-import json,os
+if [[ "$SCENARIO" == "idc" ]]; then
+  curl -fsS "${AUTH[@]}" \
+    "$API/identity-provider/instances/${KEYCLOAK_IDP_ALIAS}" > /tmp/kc_idp_final.json
+  python3 - <<'PYEOF'
+import json
 d = json.load(open("/tmp/kc_idp_final.json"))
 cfg = d.get("config") or {}
 print(f"  IdP alias        = {d.get('alias')}")
-print(f"  providerId       = {d.get('providerId')}")
+print(f"  enabled          = {d.get('enabled')}")
 print(f"  entityId(SP)     = {cfg.get('entityId')}")
 print(f"  IdP SSO URL      = {cfg.get('singleSignOnServiceUrl')}")
 print(f"  nameIDFormat     = {cfg.get('nameIDPolicyFormat')}")
 print(f"  syncMode         = {cfg.get('syncMode')}")
-print(f"  trustEmail       = {d.get('trustEmail')}")
 PYEOF
+fi
 
 curl -fsS "${AUTH[@]}" \
   "$API/clients?clientId=${KEYCLOAK_OIDC_CLIENT_ID}" > /tmp/kc_client_final.json
@@ -280,4 +292,4 @@ print(f"  optionalScopes   = {c.get('optionalClientScopes')}")
 PYEOF
 
 echo
-echo "Done."
+echo "Done. Scenario: $SCENARIO"
